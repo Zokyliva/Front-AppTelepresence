@@ -66,6 +66,11 @@ export function useWebRTC(roomId, pseudo) {
   const [connectionStatus, setConnectionStatus] = useState(
     socket.connected ? "connected" : "connecting"
   );
+  // Détail technique de la dernière erreur de connexion (ex: "xhr poll
+  // error", "websocket error", message CORS...). Utile pour diagnostiquer
+  // un problème de déploiement sans avoir besoin d'ouvrir les DevTools —
+  // pratique notamment sur mobile où c'est moins accessible.
+  const [connectionErrorDetail, setConnectionErrorDetail] = useState(null);
 
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [handRaised, setHandRaised] = useState(false);
@@ -204,6 +209,7 @@ export function useWebRTC(roomId, pseudo) {
   useEffect(() => {
     function handleConnect() {
       setConnectionStatus("connected");
+      setConnectionErrorDetail(null);
       // On (re)rejoint la salle à chaque connexion réussie du socket,
       // qu'il s'agisse du tout premier chargement ou d'une reconnexion
       // après coupure réseau.
@@ -223,9 +229,21 @@ export function useWebRTC(roomId, pseudo) {
       setConnectionStatus("connecting");
     }
 
+    // Déclenché à chaque tentative de connexion (ou reconnexion) qui
+    // échoue AVANT même d'établir le WebSocket — typiquement un problème
+    // CORS (origine refusée par le serveur), un serveur injoignable, ou un
+    // serveur Render encore en train de "se réveiller" (cold start du plan
+    // gratuit, jusqu'à 30-60s). Le message exact (err.message) aide à
+    // distinguer ces cas sans avoir besoin des DevTools.
+    function handleConnectError(err) {
+      console.error("Erreur de connexion Socket.IO :", err.message);
+      setConnectionErrorDetail(err.message);
+    }
+
     socket.on("connect", handleConnect);
     socket.on("disconnect", handleDisconnect);
     socket.io.on("reconnect_attempt", handleReconnectAttempt);
+    socket.on("connect_error", handleConnectError);
 
     // Cas où le socket est déjà connecté au moment où ce composant
     // apparaît (montage normal, pas une reconnexion) : on déclenche le
@@ -239,6 +257,7 @@ export function useWebRTC(roomId, pseudo) {
       socket.off("connect", handleConnect);
       socket.off("disconnect", handleDisconnect);
       socket.io.off("reconnect_attempt", handleReconnectAttempt);
+      socket.off("connect_error", handleConnectError);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId, pseudo]);
@@ -517,6 +536,7 @@ export function useWebRTC(roomId, pseudo) {
     participants,
     error,
     connectionStatus, // "connected" | "connecting" | "disconnected"
+    connectionErrorDetail, // détail technique de la dernière erreur (ou null)
     toggleTrack,
     isScreenSharing,
     toggleScreenShare,

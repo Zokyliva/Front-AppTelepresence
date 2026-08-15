@@ -16,6 +16,7 @@ export default function VideoCall({ roomId, pseudo }) {
     participants,
     error,
     connectionStatus,
+    connectionErrorDetail,
     toggleTrack,
     isScreenSharing,
     toggleScreenShare,
@@ -51,6 +52,11 @@ export default function VideoCall({ roomId, pseudo }) {
           {connectionStatus === "disconnected"
             ? "Connexion perdue — tentative de reconnexion en cours..."
             : "Connexion au serveur en cours..."}
+          {connectionErrorDetail && (
+            <div className="mt-1 text-xs text-amber-600 font-mono break-words">
+              Détail : {connectionErrorDetail}
+            </div>
+          )}
         </div>
       )}
 
