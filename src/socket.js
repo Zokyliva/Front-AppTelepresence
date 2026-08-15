@@ -26,6 +26,8 @@ export const socket = io(SERVER_URL, {
   reconnectionAttempts: Infinity, // ne jamais abandonner
   reconnectionDelay: 1000, // 1re tentative après 1s
   reconnectionDelayMax: 5000, // jamais plus de 5s entre deux tentatives
+  timeout: 20000, // 20 secondes de timeout
+  transports: ['websocket', 'polling'], // Force WebSocket d'abord
 });
 
 // Remarque : côté application (voir hooks/useWebRTC.js), on écoute les
