@@ -1,548 +1,306 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import { socket } from "../socket";
+import { socket } from "../lib/socket.js";
 
-// -----------------------------------------------------------------------------
-// CONFIGURATION ICE (Interactive Connectivity Establishment)
-// -----------------------------------------------------------------------------
-// WebRTC a besoin de "serveurs ICE" pour découvrir comment deux navigateurs
-// peuvent se joindre directement (P2P), même s'ils sont chacun derrière un
-// routeur / NAT.
-//
-// - Un serveur STUN dit à un navigateur "voici ton adresse IP publique vue
-//   de l'extérieur". C'est suffisant dans la majorité des cas (réseaux
-//   domestiques classiques).
-// - Un serveur TURN sert de relais quand la connexion directe est impossible
-//   (NAT symétrique, pare-feu strict) : le trafic audio/vidéo passe alors
-//   PAR ce serveur. Non inclus ici (nécessite un serveur payant ou
-//   auto-hébergé comme coturn), mais mentionné dans le README.
-const ICE_SERVERS = {
-  iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-};
+// Serveurs STUN publics : ils servent uniquement a decouvrir l'IP publique
+// de chaque navigateur pour etablir la connexion directe (peer-to-peer).
+// Aucune donnee video/audio ne transite par ces serveurs.
+const ICE_SERVERS = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+  { urls: "stun:global.stun.twilio.com:3478" },
+];
+
+// Serveur TURN optionnel (recommande pour la fiabilite sur reseaux mobiles
+// 4G/5G, qui utilisent souvent un NAT restrictif ou un STUN seul ne suffit
+// pas). Voir README > "Ameliorer la fiabilite sur mobile" pour l'obtenir
+// gratuitement (ex: Metered, Twilio, OpenRelay) et le renseigner ici via
+// des variables d'environnement Vite.
+const TURN_URL = import.meta.env.VITE_TURN_URL;
+const TURN_USERNAME = import.meta.env.VITE_TURN_USERNAME;
+const TURN_CREDENTIAL = import.meta.env.VITE_TURN_CREDENTIAL;
+if (TURN_URL && TURN_USERNAME && TURN_CREDENTIAL) {
+  ICE_SERVERS.push({
+    urls: TURN_URL,
+    username: TURN_USERNAME,
+    credential: TURN_CREDENTIAL,
+  });
+}
 
 /**
- * useWebRTC — cœur technique de l'application.
- *
- * Ce hook gère :
- *   1. La connexion/reconnexion à la salle (Socket.IO), y compris après une
- *      coupure réseau (reconnexion automatique).
- *   2. L'acquisition de la webcam/micro et la création d'une
- *      RTCPeerConnection par participant distant (signalisation WebRTC).
- *   3. Le partage d'écran (remplacement de la piste vidéo envoyée aux pairs).
- *   4. La fonctionnalité "lever la main".
- *
- * Vue d'ensemble du flux de données :
- *
- *   Navigateur A                    Serveur (Socket.IO)                Navigateur B
- *   ─────────────                   ────────────────────               ─────────────
- *   room:join        ────────────►  ajoute A à la salle
- *                     ◄────────────  room:participants (liste incl. B)
- *   webrtc:offer      ────────────►  relaie tel quel      ────────────► webrtc:offer
- *                                                          ◄──────────── webrtc:answer
- *   webrtc:answer     ◄────────────  relaie tel quel
- *   webrtc:ice-cand.  ◄───────────►  relaie tel quel      ◄───────────► webrtc:ice-cand.
- *                                                                        (répété plusieurs fois)
- *
- *   Une fois l'échange terminé : connexion DIRECTE entre A et B pour
- *   l'audio/vidéo. Le serveur ne voit plus jamais ce flux, seulement la
- *   signalisation (petits messages texte) et le chat.
- *
- * @param {string} roomId - identifiant de la salle à rejoindre
- * @param {string} pseudo - nom affiché de l'utilisateur local
+ * Gere une "salle" en topologie mesh : le navigateur local ouvre une
+ * RTCPeerConnection distincte vers CHAQUE autre participant. C'est simple
+ * a comprendre et suffisant pour un petit groupe, mais ca ne scale pas a
+ * l'infini (voir note dans le README) : c'est pour ca que le serveur
+ * plafonne les salles a 25 participants.
  */
-export function useWebRTC(roomId, pseudo) {
-  // ---------------------------------------------------------------------
-  // ÉTAT REACT (déclenche un re-rendu quand il change)
-  // ---------------------------------------------------------------------
-  const [localStream, setLocalStream] = useState(null);
-  // remoteStreams : { [socketId]: { stream: MediaStream, pseudo: string } }
-  // Un flux vidéo/audio par participant distant, indexé par son socket.id.
-  const [remoteStreams, setRemoteStreams] = useState({});
-  const [participants, setParticipants] = useState([]);
-  const [error, setError] = useState(null);
+export function useWebRTC({ roomId, name, localStream }) {
+  const [status, setStatus] = useState("connecting"); // connecting | connected | error | full
+  const [errorMessage, setErrorMessage] = useState("");
+  const [peers, setPeers] = useState({}); // { [peerId]: { name, stream, micOn, camOn } }
+  const [chatMessages, setChatMessages] = useState([]);
+  const [typingUsers, setTypingUsers] = useState({}); // { [peerId]: name }
 
-  // "disconnected" | "connecting" | "connected"
-  // Reflète l'état de la connexion Socket.IO (donc du serveur de
-  // signalisation), pour informer l'utilisateur en cas de coupure réseau.
-  const [connectionStatus, setConnectionStatus] = useState(
-    socket.connected ? "connected" : "connecting"
-  );
-  // Détail technique de la dernière erreur de connexion (ex: "xhr poll
-  // error", "websocket error", message CORS...). Utile pour diagnostiquer
-  // un problème de déploiement sans avoir besoin d'ouvrir les DevTools —
-  // pratique notamment sur mobile où c'est moins accessible.
-  const [connectionErrorDetail, setConnectionErrorDetail] = useState(null);
+  const peerConnections = useRef(new Map()); // peerId -> RTCPeerConnection
+  const pendingCandidates = useRef(new Map()); // peerId -> ICE candidates en attente
+  const localStreamRef = useRef(localStream);
+  localStreamRef.current = localStream;
 
-  const [isScreenSharing, setIsScreenSharing] = useState(false);
-  const [handRaised, setHandRaised] = useState(false);
-  // remoteHandsRaised : { [socketId]: boolean }
-  const [remoteHandsRaised, setRemoteHandsRaised] = useState({});
-  // remoteScreenSharing : { [socketId]: boolean } — qui partage son écran
-  const [remoteScreenSharing, setRemoteScreenSharing] = useState({});
-
-  // ---------------------------------------------------------------------
-  // RÉFÉRENCES (ne déclenchent PAS de re-rendu ; état "technique" persistant)
-  // ---------------------------------------------------------------------
-  // Une RTCPeerConnection par participant distant, indexée par son socket.id.
-  const peerConnectionsRef = useRef({});
-  // Le flux webcam/micro d'origine (toujours conservé, même pendant un
-  // partage d'écran, pour pouvoir y revenir ensuite).
-  const localStreamRef = useRef(null);
-  // Le flux de partage d'écran actif, s'il y en a un.
-  const screenStreamRef = useRef(null);
-
-  // =========================================================================
-  // 1. GESTION D'UNE CONNEXION PEER (RTCPeerConnection)
-  // =========================================================================
-
-  /**
-   * Crée (ou récupère si elle existe déjà) la RTCPeerConnection associée à
-   * un participant distant donné.
-   *
-   * Une RTCPeerConnection représente UNE connexion P2P vers UN pair. Dans
-   * une salle à N participants, chaque navigateur maintient donc (N-1)
-   * RTCPeerConnection (topologie "mesh complet"). C'est simple à mettre en
-   * œuvre mais coûteux en bande passante au-delà de 4-5 participants — au
-   *-delà, on utiliserait plutôt un serveur SFU (hors cadre de ce cours).
-   */
-  const createPeerConnection = useCallback((remoteSocketId, remotePseudo) => {
-    if (peerConnectionsRef.current[remoteSocketId]) {
-      return peerConnectionsRef.current[remoteSocketId];
-    }
-
-    const pc = new RTCPeerConnection(ICE_SERVERS);
-
-    // On ajoute nos pistes locales (audio + vidéo, ou audio + partage
-    // d'écran si actif) à la nouvelle connexion, pour que le pair distant
-    // les reçoive.
-    const streamToSend = screenStreamRef.current || localStreamRef.current;
-    if (streamToSend) {
-      streamToSend.getTracks().forEach((track) => {
-        pc.addTrack(track, streamToSend);
-      });
-    }
-
-    // Événement déclenché quand on REÇOIT une piste (vidéo ou audio) du
-    // pair distant. C'est ici qu'on récupère son flux pour l'afficher.
-    pc.ontrack = (event) => {
-      setRemoteStreams((prev) => ({
-        ...prev,
-        [remoteSocketId]: {
-          stream: event.streams[0],
-          pseudo: remotePseudo,
-        },
-      }));
-    };
-
-    // Pendant la négociation, le navigateur découvre progressivement les
-    // chemins réseau possibles ("candidats ICE") pour joindre le pair. Il
-    // faut les transmettre au fur et à mesure via le serveur de
-    // signalisation (ils ne sont PAS inclus dans l'offer/answer initiale).
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        socket.emit("webrtc:ice-candidate", {
-          to: remoteSocketId,
-          candidate: event.candidate,
-        });
-      }
-    };
-
-    // Si la connexion tombe (réseau coupé côté pair, pair qui ferme son
-    // onglet sans prévenir proprement, etc.), on nettoie notre référence
-    // locale pour ne pas garder une tuile vidéo "fantôme".
-    pc.onconnectionstatechange = () => {
-      if (["disconnected", "failed", "closed"].includes(pc.connectionState)) {
-        removePeer(remoteSocketId);
-      }
-    };
-
-    peerConnectionsRef.current[remoteSocketId] = pc;
-    return pc;
+  const updatePeer = useCallback((peerId, patch) => {
+    setPeers((prev) => ({
+      ...prev,
+      [peerId]: { ...prev[peerId], ...patch },
+    }));
   }, []);
 
-  /** Ferme proprement une RTCPeerConnection et oublie son flux distant. */
-  const removePeer = (remoteSocketId) => {
-    const pc = peerConnectionsRef.current[remoteSocketId];
-    if (pc) {
-      pc.close();
-      delete peerConnectionsRef.current[remoteSocketId];
-    }
-    setRemoteStreams((prev) => {
-      const copy = { ...prev };
-      delete copy[remoteSocketId];
-      return copy;
-    });
-    setRemoteHandsRaised((prev) => {
-      const copy = { ...prev };
-      delete copy[remoteSocketId];
-      return copy;
-    });
-    setRemoteScreenSharing((prev) => {
-      const copy = { ...prev };
-      delete copy[remoteSocketId];
-      return copy;
-    });
-  };
-
-  /** Ferme TOUTES les connexions peer actuelles (utilisé à la reconnexion). */
-  const removeAllPeers = () => {
-    Object.keys(peerConnectionsRef.current).forEach(removePeer);
-  };
-
-  // =========================================================================
-  // 2. CONNEXION / RECONNEXION À LA SALLE (Socket.IO)
-  // =========================================================================
-  //
-  // Socket.IO essaie de se reconnecter automatiquement en cas de coupure
-  // réseau (c'est un comportement par défaut de la librairie : backoff
-  // exponentiel, plusieurs tentatives). Mais reconnecter le WEBSOCKET ne
-  // suffit pas : après une coupure, le client obtient un NOUVEAU socket.id
-  // côté serveur, donc il faut :
-  //   (a) renvoyer "room:join" pour être re-rattaché à la salle,
-  //   (b) réinitialiser nos connexions WebRTC locales, car les pairs
-  //       distants nous considèrent comme parti (ils ont reçu
-  //       "room:user-left" pendant la coupure) et attendent une nouvelle
-  //       offre s'ils nous revoient arriver.
-  //
-  // L'écoute de l'événement "connect" (et non un simple appel unique au
-  // montage) permet de gérer le premier chargement ET chaque reconnexion
-  // avec la même logique.
-  useEffect(() => {
-    function handleConnect() {
-      setConnectionStatus("connected");
-      setConnectionErrorDetail(null);
-      // On (re)rejoint la salle à chaque connexion réussie du socket,
-      // qu'il s'agisse du tout premier chargement ou d'une reconnexion
-      // après coupure réseau.
-      socket.emit("room:join", { roomId, pseudo });
-    }
-
-    function handleDisconnect() {
-      setConnectionStatus("disconnected");
-      // Nos anciennes RTCPeerConnection ne servent plus à rien : à la
-      // reconnexion, on récupérera un nouveau socket.id et il faudra de
-      // toute façon renégocier une connexion WebRTC avec chaque pair.
-      removeAllPeers();
-      setParticipants([]);
-    }
-
-    function handleReconnectAttempt() {
-      setConnectionStatus("connecting");
-    }
-
-    // Déclenché à chaque tentative de connexion (ou reconnexion) qui
-    // échoue AVANT même d'établir le WebSocket — typiquement un problème
-    // CORS (origine refusée par le serveur), un serveur injoignable, ou un
-    // serveur Render encore en train de "se réveiller" (cold start du plan
-    // gratuit, jusqu'à 30-60s). Le message exact (err.message) aide à
-    // distinguer ces cas sans avoir besoin des DevTools.
-    function handleConnectError(err) {
-      console.error("Erreur de connexion Socket.IO :", err.message);
-      setConnectionErrorDetail(err.message);
-    }
-
-    socket.on("connect", handleConnect);
-    socket.on("disconnect", handleDisconnect);
-    socket.io.on("reconnect_attempt", handleReconnectAttempt);
-    socket.on("connect_error", handleConnectError);
-
-    // Cas où le socket est déjà connecté au moment où ce composant
-    // apparaît (montage normal, pas une reconnexion) : on déclenche le
-    // join immédiatement plutôt que d'attendre un futur événement
-    // "connect" qui ne se reproduira pas puisqu'on est déjà connecté.
-    if (socket.connected) {
-      handleConnect();
-    }
-
-    return () => {
-      socket.off("connect", handleConnect);
-      socket.off("disconnect", handleDisconnect);
-      socket.io.off("reconnect_attempt", handleReconnectAttempt);
-      socket.off("connect_error", handleConnectError);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomId, pseudo]);
-
-  // =========================================================================
-  // 3. ACQUISITION DE LA WEBCAM / MICRO
-  // =========================================================================
-  // Indépendant de la connexion à la salle : si getUserMedia échoue
-  // (permission refusée, caméra déjà utilisée ailleurs), le chat et la
-  // liste des participants doivent continuer à fonctionner normalement.
-  useEffect(() => {
-    let isMounted = true;
-
-    async function initMedia() {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: true,
-          audio: true,
-        });
-        if (!isMounted) return;
-
-        localStreamRef.current = stream;
-        setLocalStream(stream);
-      } catch (err) {
-        console.error("Erreur d'accès à la caméra/micro :", err);
-        setError(
-          "Impossible d'accéder à la caméra ou au micro (elle est peut-être déjà utilisée par un autre onglet ou une autre application). Le chat et la liste des participants restent disponibles."
-        );
-      }
-    }
-
-    initMedia();
-
-    return () => {
-      isMounted = false;
-    };
-  }, []);
-
-  // =========================================================================
-  // 4. ÉCOUTE DES ÉVÉNEMENTS DE SIGNALISATION ET DE PRÉSENCE
-  // =========================================================================
-  useEffect(() => {
-    // Reçu juste après "room:join" : la liste des participants déjà
-    // présents dans la salle. La convention adoptée ici est que c'est
-    // TOUJOURS le nouvel arrivant qui initie la connexion WebRTC (envoie
-    // l'"offer") vers chaque participant existant.
-    async function handleParticipants(existingParticipants) {
-      setParticipants(existingParticipants);
-
-      for (const p of existingParticipants) {
-        const pc = createPeerConnection(p.socketId, p.pseudo);
-        // createOffer() génère une description SDP (Session Description
-        // Protocol) qui décrit nos capacités multimédia (codecs
-        // supportés, résolution, etc.). setLocalDescription() l'applique
-        // localement et déclenche la collecte des candidats ICE.
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        socket.emit("webrtc:offer", { to: p.socketId, offer });
-      }
-    }
-
-    // Un nouveau participant vient d'arriver : on l'ajoute à notre liste,
-    // mais on n'initie PAS de connexion nous-mêmes — c'est lui qui va nous
-    // envoyer une "offer" (voir handleParticipants ci-dessus, exécuté de
-    // son côté).
-    function handleUserJoined({ socketId, pseudo: newPseudo }) {
-      setParticipants((prev) => [
-        ...prev,
-        { socketId, pseudo: newPseudo, joinedAt: Date.now() },
-      ]);
-    }
-
-    // On reçoit une offer : quelqu'un veut établir une connexion WebRTC
-    // avec nous. On répond par une "answer".
-    async function handleOffer({ from, offer }) {
-      const fromParticipant = participants.find((p) => p.socketId === from);
-      const pc = createPeerConnection(from, fromParticipant?.pseudo);
-      await pc.setRemoteDescription(new RTCSessionDescription(offer));
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      socket.emit("webrtc:answer", { to: from, answer });
-    }
-
-    // Réponse à notre offer initiale : on finalise la description distante.
-    async function handleAnswer({ from, answer }) {
-      const pc = peerConnectionsRef.current[from];
-      if (pc) {
-        await pc.setRemoteDescription(new RTCSessionDescription(answer));
-      }
-    }
-
-    // Un candidat ICE (chemin réseau possible) envoyé par un pair : on
-    // l'ajoute à notre connexion pour tester s'il permet d'établir le lien
-    // direct.
-    async function handleIceCandidate({ from, candidate }) {
-      const pc = peerConnectionsRef.current[from];
-      if (pc && candidate) {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (err) {
-          console.error("Erreur ICE candidate :", err);
-        }
-      }
-    }
-
-    function handleUserLeft({ socketId }) {
-      removePeer(socketId);
-      setParticipants((prev) => prev.filter((p) => p.socketId !== socketId));
-    }
-
-    // ---- Lever la main : mise à jour de l'état d'un participant distant ----
-    function handleHandRaise({ socketId, raised }) {
-      setRemoteHandsRaised((prev) => ({ ...prev, [socketId]: raised }));
-    }
-
-    // ---- Partage d'écran : un pair distant démarre/arrête son partage ----
-    function handleScreenShare({ socketId, sharing }) {
-      setRemoteScreenSharing((prev) => ({ ...prev, [socketId]: sharing }));
-    }
-
-    socket.on("room:participants", handleParticipants);
-    socket.on("room:user-joined", handleUserJoined);
-    socket.on("webrtc:offer", handleOffer);
-    socket.on("webrtc:answer", handleAnswer);
-    socket.on("webrtc:ice-candidate", handleIceCandidate);
-    socket.on("room:user-left", handleUserLeft);
-    socket.on("hand:raise", handleHandRaise);
-    socket.on("screen:share", handleScreenShare);
-
-    return () => {
-      socket.off("room:participants", handleParticipants);
-      socket.off("room:user-joined", handleUserJoined);
-      socket.off("webrtc:offer", handleOffer);
-      socket.off("webrtc:answer", handleAnswer);
-      socket.off("webrtc:ice-candidate", handleIceCandidate);
-      socket.off("room:user-left", handleUserLeft);
-      socket.off("hand:raise", handleHandRaise);
-      socket.off("screen:share", handleScreenShare);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [createPeerConnection, participants]);
-
-  // =========================================================================
-  // 5. NETTOYAGE COMPLET (sortie de salle / démontage du composant)
-  // =========================================================================
-  useEffect(() => {
-    return () => {
-      removeAllPeers();
-      if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((track) => track.stop());
-      }
-      if (screenStreamRef.current) {
-        screenStreamRef.current.getTracks().forEach((track) => track.stop());
-      }
-      socket.emit("room:leave");
-    };
-  }, []);
-
-  // =========================================================================
-  // 6. CONTRÔLES CAMÉRA / MICRO
-  // =========================================================================
-  const toggleTrack = useCallback(
-    (kind) => {
-      if (!localStreamRef.current) return;
-      const tracks =
-        kind === "video"
-          ? localStreamRef.current.getVideoTracks()
-          : localStreamRef.current.getAudioTracks();
-
-      tracks.forEach((track) => {
-        track.enabled = !track.enabled;
-        socket.emit("media:toggle", { roomId, kind, enabled: track.enabled });
-      });
-    },
-    [roomId]
-  );
-
-  // =========================================================================
-  // 7. PARTAGE D'ÉCRAN
-  // =========================================================================
-  //
-  // Principe : getDisplayMedia() ouvre une fenêtre système où l'utilisateur
-  // choisit un écran/une fenêtre/un onglet à partager, et renvoie un
-  // MediaStream comme getUserMedia(). On ne crée PAS de nouvelles
-  // RTCPeerConnection : on utilise replaceTrack() sur chaque connexion déjà
-  // établie, ce qui remplace la piste vidéo envoyée SANS renégociation
-  // complète (pas de nouvel échange offer/answer nécessaire). C'est la
-  // technique standard pour ce cas d'usage.
-
-  const startScreenShare = useCallback(async () => {
-    try {
-      const screenStream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        // La plupart des navigateurs permettent aussi de partager l'audio
-        // d'un onglet ; on ne le demande pas ici pour rester simple.
-      });
-
-      screenStreamRef.current = screenStream;
-      const screenTrack = screenStream.getVideoTracks()[0];
-
-      // Pour chaque connexion peer existante, on remplace la piste vidéo
-      // envoyée (la webcam) par celle du partage d'écran.
-      Object.values(peerConnectionsRef.current).forEach((pc) => {
-        const videoSender = pc
-          .getSenders()
-          .find((sender) => sender.track && sender.track.kind === "video");
-        if (videoSender) {
-          videoSender.replaceTrack(screenTrack);
-        }
-      });
-
-      setIsScreenSharing(true);
-      socket.emit("screen:share", { roomId, sharing: true });
-
-      // Si l'utilisateur arrête le partage depuis l'UI native du
-      // navigateur (bouton "Arrêter le partage" de Chrome/Firefox) plutôt
-      // que depuis notre bouton, on doit revenir à la webcam nous aussi.
-      screenTrack.onended = () => {
-        stopScreenShare();
-      };
-    } catch (err) {
-      // L'utilisateur a annulé la sélection d'écran, ou permission refusée.
-      console.error("Partage d'écran annulé ou refusé :", err);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomId]);
-
-  const stopScreenShare = useCallback(() => {
-    if (screenStreamRef.current) {
-      screenStreamRef.current.getTracks().forEach((track) => track.stop());
-      screenStreamRef.current = null;
-    }
-
-    // On revient à la piste webcam d'origine pour chaque connexion peer.
-    const webcamTrack = localStreamRef.current?.getVideoTracks()[0];
-    if (webcamTrack) {
-      Object.values(peerConnectionsRef.current).forEach((pc) => {
-        const videoSender = pc
-          .getSenders()
-          .find((sender) => sender.track && sender.track.kind === "video");
-        if (videoSender) {
-          videoSender.replaceTrack(webcamTrack);
-        }
-      });
-    }
-
-    setIsScreenSharing(false);
-    socket.emit("screen:share", { roomId, sharing: false });
-  }, [roomId]);
-
-  const toggleScreenShare = useCallback(() => {
-    if (isScreenSharing) {
-      stopScreenShare();
-    } else {
-      startScreenShare();
-    }
-  }, [isScreenSharing, startScreenShare, stopScreenShare]);
-
-  // =========================================================================
-  // 8. LEVER LA MAIN
-  // =========================================================================
-  // Fonctionnalité purement "sociale" : ne transite jamais par WebRTC,
-  // seulement par Socket.IO (comme le chat), car il n'y a pas de flux
-  // continu à transporter, juste une notification ponctuelle.
-  const toggleHandRaise = useCallback(() => {
-    setHandRaised((prev) => {
-      const next = !prev;
-      socket.emit("hand:raise", { roomId, raised: next });
+  const removePeer = useCallback((peerId) => {
+    setPeers((prev) => {
+      const next = { ...prev };
+      delete next[peerId];
       return next;
     });
-  }, [roomId]);
+  }, []);
+
+  // ------------------------------------------------------------------
+  // Cree (ou reutilise) une RTCPeerConnection pour un participant donne
+  // ------------------------------------------------------------------
+  const getOrCreatePeerConnection = useCallback(
+    (peerId, peerName) => {
+      if (peerConnections.current.has(peerId)) {
+        return peerConnections.current.get(peerId);
+      }
+
+      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+
+      // On ajoute nos pistes locales (camera + micro) a la connexion
+      const stream = localStreamRef.current;
+      if (stream) {
+        stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+      }
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          socket.emit("signal", {
+            to: peerId,
+            data: { candidate: event.candidate },
+          });
+        }
+      };
+
+      pc.ontrack = (event) => {
+        updatePeer(peerId, { name: peerName, stream: event.streams[0] });
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (["failed", "closed"].includes(pc.connectionState)) {
+          // Connexion morte : on nettoie proprement. Si le peer est
+          // toujours dans la salle, il sera reconnecte via un nouvel
+          // evenement (le mecanisme repose sur user-left/disconnect
+          // cote serveur pour forcer un cycle propre plutot qu'un
+          // ICE-restart, plus simple pour un MVP).
+          pc.close();
+          peerConnections.current.delete(peerId);
+        }
+      };
+
+      peerConnections.current.set(peerId, pc);
+      updatePeer(peerId, { name: peerName, micOn: true, camOn: true });
+      return pc;
+    },
+    [updatePeer]
+  );
+
+  const closePeerConnection = useCallback((peerId) => {
+    const pc = peerConnections.current.get(peerId);
+    if (pc) {
+      pc.close();
+      peerConnections.current.delete(peerId);
+    }
+    pendingCandidates.current.delete(peerId);
+  }, []);
+
+  // ------------------------------------------------------------------
+  // Initie une offre SDP vers un participant deja present dans la salle
+  // ------------------------------------------------------------------
+  const callPeer = useCallback(
+    async (peerId, peerName) => {
+      const pc = getOrCreatePeerConnection(peerId, peerName);
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        socket.emit("signal", {
+          to: peerId,
+          data: { description: pc.localDescription },
+        });
+      } catch (err) {
+        console.error("Erreur creation d'offre vers", peerId, err);
+      }
+    },
+    [getOrCreatePeerConnection]
+  );
+
+  // ------------------------------------------------------------------
+  // Reception d'un message de signaling (offre / reponse / candidat ICE)
+  // ------------------------------------------------------------------
+  const handleSignal = useCallback(
+    async ({ from, name: peerName, data }) => {
+      const pc = getOrCreatePeerConnection(from, peerName);
+
+      try {
+        if (data.description) {
+          // Si on recoit une offre alors qu'on a deja une negociation en
+          // cours (glare), on ignore poliment - suffisant pour ce MVP.
+          if (
+            data.description.type === "offer" &&
+            pc.signalingState !== "stable" &&
+            pc.signalingState !== "have-local-offer"
+          ) {
+            return;
+          }
+
+          await pc.setRemoteDescription(new RTCSessionDescription(data.description));
+
+          // On applique les candidats ICE recus avant d'avoir la description
+          const queued = pendingCandidates.current.get(from) || [];
+          for (const candidate of queued) {
+            await pc.addIceCandidate(new RTCIceCandidate(candidate));
+          }
+          pendingCandidates.current.delete(from);
+
+          if (data.description.type === "offer") {
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            socket.emit("signal", {
+              to: from,
+              data: { description: pc.localDescription },
+            });
+          }
+        } else if (data.candidate) {
+          if (pc.remoteDescription && pc.remoteDescription.type) {
+            await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+          } else {
+            // La description distante n'est pas encore arrivee : on met
+            // le candidat de cote pour l'appliquer juste apres.
+            const queue = pendingCandidates.current.get(from) || [];
+            queue.push(data.candidate);
+            pendingCandidates.current.set(from, queue);
+          }
+        }
+      } catch (err) {
+        console.error("Erreur traitement signal de", from, err);
+      }
+    },
+    [getOrCreatePeerConnection]
+  );
+
+  // ------------------------------------------------------------------
+  // Cycle de vie : connexion socket + abonnements aux evenements
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    if (!roomId || !name || !localStream) return;
+
+    let cancelled = false;
+    setStatus("connecting");
+    setErrorMessage("");
+
+    socket.connect();
+
+    socket.on("connect_error", () => {
+      if (!cancelled) {
+        setStatus("error");
+        setErrorMessage(
+          "Impossible de joindre le serveur. Il est peut-être en veille (cold start Render) : réessaie dans quelques secondes."
+        );
+      }
+    });
+
+    socket.on("signal", handleSignal);
+
+    socket.on("user-joined", ({ id, name: peerName }) => {
+      // Un nouveau participant vient d'arriver APRES nous : on ne fait
+      // rien, c'est lui qui va nous envoyer une offre.
+      updatePeer(id, { name: peerName });
+    });
+
+    socket.on("user-left", ({ id }) => {
+      closePeerConnection(id);
+      removePeer(id);
+      setTypingUsers((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+    });
+
+    socket.on("chat-message", (msg) => {
+      setChatMessages((prev) => [...prev, msg]);
+    });
+
+    socket.on("typing", ({ id, name: peerName, isTyping }) => {
+      setTypingUsers((prev) => {
+        const next = { ...prev };
+        if (isTyping) next[id] = peerName;
+        else delete next[id];
+        return next;
+      });
+    });
+
+    socket.on("peer-media-state", ({ id, kind, enabled }) => {
+      if (kind === "audio") updatePeer(id, { micOn: enabled });
+      if (kind === "video") updatePeer(id, { camOn: enabled });
+    });
+
+    socket.on("connect", () => {
+      socket.emit("join-room", { roomId, name }, (res) => {
+        if (cancelled) return;
+        if (!res?.ok) {
+          setStatus(res?.error?.includes("pleine") ? "full" : "error");
+          setErrorMessage(res?.error || "Impossible de rejoindre la salle.");
+          return;
+        }
+        setStatus("connected");
+        // On initie une offre vers chaque participant deja present
+        res.participants.forEach((p) => callPeer(p.id, p.name));
+      });
+    });
+
+    return () => {
+      cancelled = true;
+      socket.off("connect_error");
+      socket.off("signal", handleSignal);
+      socket.off("user-joined");
+      socket.off("user-left");
+      socket.off("chat-message");
+      socket.off("typing");
+      socket.off("peer-media-state");
+      socket.off("connect");
+      peerConnections.current.forEach((pc) => pc.close());
+      peerConnections.current.clear();
+      pendingCandidates.current.clear();
+      socket.disconnect();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId, name, localStream]);
+
+  const sendChatMessage = useCallback((text) => {
+    socket.emit("chat-message", { text });
+  }, []);
+
+  const sendTyping = useCallback((isTyping) => {
+    socket.emit("typing", { isTyping });
+  }, []);
+
+  const broadcastMediaState = useCallback((kind, enabled) => {
+    socket.emit("media-state", { kind, enabled });
+  }, []);
 
   return {
-    localStream,
-    remoteStreams, // { [socketId]: { stream, pseudo } }
-    participants,
-    error,
-    connectionStatus, // "connected" | "connecting" | "disconnected"
-    connectionErrorDetail, // détail technique de la dernière erreur (ou null)
-    toggleTrack,
-    isScreenSharing,
-    toggleScreenShare,
-    remoteScreenSharing, // { [socketId]: boolean }
-    handRaised,
-    toggleHandRaise,
-    remoteHandsRaised, // { [socketId]: boolean }
+    status,
+    errorMessage,
+    peers,
+    chatMessages,
+    typingUsers,
+    sendChatMessage,
+    sendTyping,
+    broadcastMediaState,
   };
 }

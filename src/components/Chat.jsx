@@ -1,95 +1,104 @@
 import { useEffect, useRef, useState } from "react";
-import { socket } from "../socket";
 
-/**
- * Chat — messagerie texte de la salle.
- *
- * Contrairement à VideoCall, ce composant ne touche JAMAIS à WebRTC : le
- * texte transite entièrement via Socket.IO (client -> serveur -> tous les
- * clients de la salle), car il n'y a pas d'intérêt à établir une connexion
- * P2P pour de si petits messages ponctuels — le serveur suffit largement,
- * et ça simplifie beaucoup le code.
- *
- * Se reconnecte automatiquement avec le reste de l'app grâce à la
- * reconnexion Socket.IO : si la connexion tombe puis revient, useWebRTC
- * (dans VideoCall) renvoie "room:join", ce qui déclenche côté serveur un
- * nouvel envoi de "chat:history" — donc l'historique se resynchronise tout
- * seul sans code supplémentaire ici.
- */
-export default function Chat({ roomId }) {
-  const [messages, setMessages] = useState([]);
-  const [draft, setDraft] = useState("");
-  const bottomRef = useRef(null);
+export default function Chat({
+  messages,
+  selfId,
+  typingLabel,
+  onSend,
+  onTyping,
+  onClose,
+}) {
+  const [text, setText] = useState("");
+  const scrollRef = useRef(null);
+  const typingTimeout = useRef(null);
 
   useEffect(() => {
-    // Un nouveau message envoyé par n'importe qui dans la salle (nous y
-    // compris — le serveur nous renvoie aussi nos propres messages).
-    function handleMessage(payload) {
-      setMessages((prev) => [...prev, payload]);
-    }
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+  }, [messages, typingLabel]);
 
-    // Reçu à chaque fois qu'on (re)rejoint la salle : tous les messages
-    // déjà échangés avant notre arrivée (ou pendant une coupure réseau).
-    // On REMPLACE la liste plutôt que d'ajouter, pour éviter les doublons
-    // en cas de reconnexion.
-    function handleHistory(history) {
-      setMessages(history);
-    }
+  function handleChange(e) {
+    setText(e.target.value);
+    onTyping(true);
+    clearTimeout(typingTimeout.current);
+    typingTimeout.current = setTimeout(() => onTyping(false), 1500);
+  }
 
-    socket.on("chat:message", handleMessage);
-    socket.on("chat:history", handleHistory);
-    return () => {
-      socket.off("chat:message", handleMessage);
-      socket.off("chat:history", handleHistory);
-    };
-  }, []);
-
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
-
-  function sendMessage(e) {
+  function handleSubmit(e) {
     e.preventDefault();
-    const trimmed = draft.trim();
-    if (!trimmed) return;
+    const clean = text.trim();
+    if (!clean) return;
+    onSend(clean);
+    setText("");
+    onTyping(false);
+    clearTimeout(typingTimeout.current);
+  }
 
-    socket.emit("chat:message", { roomId, message: trimmed });
-    setDraft("");
+  function formatTime(ts) {
+    return new Date(ts).toLocaleTimeString("fr-FR", {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
   }
 
   return (
-    <div className="flex flex-col h-full bg-white rounded-xl shadow-md border border-gray-200">
-      <div className="px-4 py-3 border-b border-gray-200 font-semibold text-gray-700">
-        Chat de la salle
-      </div>
-
-      <div className="flex-1 overflow-y-auto px-4 py-2 space-y-2">
-        {messages.length === 0 && (
-          <p className="text-sm text-gray-400 italic">Aucun message pour l'instant.</p>
+    <div className="flex h-full flex-col bg-panel">
+      <div className="flex items-center justify-between border-b border-slate-800 px-4 py-3">
+        <h2 className="text-sm font-semibold text-white">Chat</h2>
+        {onClose && (
+          <button
+            onClick={onClose}
+            className="text-slate-400 hover:text-white text-sm md:hidden"
+            aria-label="Fermer le chat"
+          >
+            ✕
+          </button>
         )}
-        {messages.map((msg, idx) => (
-          <div key={idx} className="text-sm">
-            <span className="font-semibold text-indigo-600">{msg.pseudo}</span>{" "}
-            <span className="text-gray-400 text-xs">
-              {new Date(msg.timestamp).toLocaleTimeString()}
-            </span>
-            <p className="text-gray-800">{msg.message}</p>
-          </div>
-        ))}
-        <div ref={bottomRef} />
       </div>
 
-      <form onSubmit={sendMessage} className="flex gap-2 p-3 border-t border-gray-200">
+      <div ref={scrollRef} className="thin-scroll flex-1 overflow-y-auto px-4 py-3 space-y-3">
+        {messages.length === 0 && (
+          <p className="text-center text-xs text-slate-600 mt-6">
+            Aucun message pour l'instant. Dis bonjour 👋
+          </p>
+        )}
+        {messages.map((m, i) => {
+          const isSelf = m.id === selfId;
+          return (
+            <div key={i} className={`flex flex-col ${isSelf ? "items-end" : "items-start"}`}>
+              <div
+                className={`max-w-[85%] rounded-2xl px-3.5 py-2 text-sm ${
+                  isSelf
+                    ? "bg-accent text-ink rounded-br-sm"
+                    : "bg-slate-800 text-slate-100 rounded-bl-sm"
+                }`}
+              >
+                {!isSelf && (
+                  <p className="mb-0.5 text-xs font-semibold text-accent">{m.name}</p>
+                )}
+                <p className="whitespace-pre-wrap break-words">{m.text}</p>
+              </div>
+              <span className="mt-0.5 text-[10px] text-slate-600">
+                {formatTime(m.time)}
+              </span>
+            </div>
+          );
+        })}
+        {typingLabel && (
+          <p className="text-xs italic text-slate-500">{typingLabel}</p>
+        )}
+      </div>
+
+      <form onSubmit={handleSubmit} className="flex gap-2 border-t border-slate-800 p-3">
         <input
-          type="text"
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          placeholder="Écrire un message..."
-          className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
+          value={text}
+          onChange={handleChange}
+          placeholder="Écrire un message…"
+          maxLength={1000}
+          className="flex-1 rounded-xl bg-ink border border-slate-700 px-3.5 py-2 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-accent/50"
         />
         <button
           type="submit"
-          className="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium px-4 py-2 rounded-lg transition"
+          className="rounded-xl bg-accent px-4 text-sm font-medium text-ink hover:brightness-110 active:scale-95 transition"
         >
           Envoyer
         </button>
