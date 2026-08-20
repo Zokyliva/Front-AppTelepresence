@@ -11,6 +11,43 @@ function randomRoomId() {
   return `${a}-${b}-${n}`;
 }
 
+// Logomark "signal en direct" : un point tally entoure d'ondes de diffusion.
+// Reference visuelle directe au sujet (telepresence / retransmission live)
+// plutot qu'une icone generique.
+function SignalMark() {
+  return (
+    <svg width="30" height="30" viewBox="0 0 30 30" fill="none" aria-hidden="true">
+      <circle cx="15" cy="15" r="3.5" fill="#ff5a3c" />
+      <path
+        d="M9 9a8.5 8.5 0 0 0 0 12"
+        stroke="#d9a441"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+      />
+      <path
+        d="M21 9a8.5 8.5 0 0 1 0 12"
+        stroke="#d9a441"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+      />
+      <path
+        d="M5 5a13.2 13.2 0 0 0 0 20"
+        stroke="#d9a441"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+        opacity="0.5"
+      />
+      <path
+        d="M25 5a13.2 13.2 0 0 1 0 20"
+        stroke="#d9a441"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+        opacity="0.5"
+      />
+    </svg>
+  );
+}
+
 export default function Home() {
   const navigate = useNavigate();
   const [name, setName] = useState(
@@ -37,21 +74,21 @@ export default function Home() {
     <main className="min-h-dvh flex items-center justify-center px-4 py-10">
       <div className="w-full max-w-sm">
         <div className="text-center mb-8">
-          <div className="inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-accent/10 text-accent text-xl mb-4">
-            ◎
+          <div className="inline-flex h-14 w-14 items-center justify-center rounded-2xl bg-panel border border-line mb-4">
+            <SignalMark />
           </div>
-          <h1 className="text-2xl font-semibold text-white">Téléprésence</h1>
-          <p className="text-slate-400 text-sm mt-1">
-            Salle vidéo + chat en temps réel — jusqu'à 25 participants
+          <h1 className="text-2xl font-bold text-paper tracking-tight">Signal</h1>
+          <p className="text-muted text-sm mt-1.5">
+            Vidéo, chat et présence en direct — 25 postes max par salle
           </p>
         </div>
 
         <form
           onSubmit={handleJoin}
-          className="bg-panel border border-slate-800 rounded-2xl p-5 space-y-4"
+          className="bg-panel border border-line rounded-2xl p-5 space-y-4"
         >
           <div>
-            <label className="block text-xs font-medium text-slate-400 mb-1.5">
+            <label className="block font-tech text-[11px] uppercase tracking-wide text-muted mb-1.5">
               Ton nom
             </label>
             <input
@@ -59,37 +96,36 @@ export default function Home() {
               onChange={(e) => setName(e.target.value)}
               placeholder="ex : Rina"
               maxLength={40}
-              className="w-full rounded-xl bg-ink border border-slate-700 px-3.5 py-2.5 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-accent/50"
+              className="w-full rounded-xl bg-ink border border-line px-3.5 py-2.5 text-sm text-paper placeholder:text-muted/70 focus:outline-none focus:ring-2 focus:ring-phosphor/50"
               autoFocus
             />
           </div>
 
           <div>
-            <label className="block text-xs font-medium text-slate-400 mb-1.5">
-              ID de la salle{" "}
-              <span className="text-slate-600">(laisser vide pour en créer une)</span>
+            <label className="block font-tech text-[11px] uppercase tracking-wide text-muted mb-1.5">
+              Canal <span className="normal-case text-muted/70">(laisser vide pour en créer un)</span>
             </label>
             <input
               value={roomId}
               onChange={(e) => setRoomId(e.target.value)}
               placeholder="ex : swift-otter-42"
               maxLength={64}
-              className="w-full rounded-xl bg-ink border border-slate-700 px-3.5 py-2.5 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-accent/50"
+              className="w-full rounded-xl bg-ink border border-line px-3.5 py-2.5 font-tech text-sm text-paper placeholder:text-muted/70 focus:outline-none focus:ring-2 focus:ring-phosphor/50"
             />
           </div>
 
-          {error && <p className="text-sm text-red-400">{error}</p>}
+          {error && <p className="text-sm text-tally">{error}</p>}
 
           <button
             type="submit"
-            className="w-full rounded-xl bg-accent text-ink font-medium py-2.5 text-sm hover:brightness-110 active:scale-[0.98] transition"
+            className="w-full rounded-xl bg-phosphor text-ink font-semibold py-2.5 text-sm hover:brightness-110 active:scale-[0.98] transition"
           >
-            Rejoindre la salle
+            Rejoindre le canal
           </button>
         </form>
 
-        <p className="text-center text-xs text-slate-600 mt-6">
-          Capacité maximale : 25 personnes par salle
+        <p className="text-center font-tech text-[11px] text-muted/70 mt-6 tracking-wide">
+          CAPACITÉ MAX · 25 PARTICIPANTS
         </p>
       </div>
     </main>

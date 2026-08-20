@@ -11,15 +11,40 @@ body,
 }
 
 body {
-  @apply bg-ink text-slate-100;
-  font-family: "Inter", system-ui, -apple-system, sans-serif;
+  @apply bg-ink text-paper;
+  font-family: "Manrope", system-ui, -apple-system, sans-serif;
+  -webkit-tap-highlight-color: transparent;
 }
 
-/* Scrollbar discrete pour le chat */
+/* Elements techniques (ID de salle, compteurs, horodatage) en mono,
+   comme un lecteur/incrustation de regie video */
+.font-tech {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  letter-spacing: 0.02em;
+}
+
+/* Scrollbar discrete pour le chat / liste des participants */
 .thin-scroll::-webkit-scrollbar {
   width: 6px;
 }
 .thin-scroll::-webkit-scrollbar-thumb {
-  background: rgba(148, 163, 184, 0.3);
+  background: rgba(168, 157, 140, 0.25);
   border-radius: 999px;
+}
+
+/* Respecte les préférences de mouvement réduit */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Focus clavier visible, cohérent avec la palette */
+:focus-visible {
+  outline: 2px solid #d9a441;
+  outline-offset: 2px;
 }

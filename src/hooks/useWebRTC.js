@@ -26,6 +26,8 @@ if (TURN_URL && TURN_USERNAME && TURN_CREDENTIAL) {
   });
 }
 
+const REACTION_LIFETIME_MS = 2500;
+
 /**
  * Gere une "salle" en topologie mesh : le navigateur local ouvre une
  * RTCPeerConnection distincte vers CHAQUE autre participant. C'est simple
@@ -36,14 +38,27 @@ if (TURN_URL && TURN_USERNAME && TURN_CREDENTIAL) {
 export function useWebRTC({ roomId, name, localStream }) {
   const [status, setStatus] = useState("connecting"); // connecting | connected | error | full
   const [errorMessage, setErrorMessage] = useState("");
-  const [peers, setPeers] = useState({}); // { [peerId]: { name, stream, micOn, camOn } }
+  // peers: { [peerId]: { name, stream, micOn, camOn, screenSharing, handRaised } }
+  const [peers, setPeers] = useState({});
   const [chatMessages, setChatMessages] = useState([]);
   const [typingUsers, setTypingUsers] = useState({}); // { [peerId]: name }
+  const [reactions, setReactions] = useState([]); // [{ key, id, name, emoji }]
 
   const peerConnections = useRef(new Map()); // peerId -> RTCPeerConnection
   const pendingCandidates = useRef(new Map()); // peerId -> ICE candidates en attente
   const localStreamRef = useRef(localStream);
   localStreamRef.current = localStream;
+
+  // Piste video actuellement envoyee a tout le monde (camera OU partage
+  // d'ecran). Toute nouvelle RTCPeerConnection utilise cette reference,
+  // pour qu'un participant qui rejoint APRES le debut d'un partage d'ecran
+  // recoive quand meme le bon flux des le depart.
+  const outgoingVideoTrackRef = useRef(null);
+  useEffect(() => {
+    if (localStream) {
+      outgoingVideoTrackRef.current = localStream.getVideoTracks()[0] || null;
+    }
+  }, [localStream]);
 
   const updatePeer = useCallback((peerId, patch) => {
     setPeers((prev) => ({
@@ -71,11 +86,14 @@ export function useWebRTC({ roomId, name, localStream }) {
 
       const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
-      // On ajoute nos pistes locales (camera + micro) a la connexion
+      // Piste audio : toujours celle du micro local.
       const stream = localStreamRef.current;
-      if (stream) {
-        stream.getTracks().forEach((track) => pc.addTrack(track, stream));
-      }
+      const audioTrack = stream?.getAudioTracks()[0];
+      if (audioTrack) pc.addTrack(audioTrack, stream);
+
+      // Piste video : la piste "sortante" courante (camera ou ecran partage).
+      const videoTrack = outgoingVideoTrackRef.current;
+      if (videoTrack) pc.addTrack(videoTrack, stream);
 
       pc.onicecandidate = (event) => {
         if (event.candidate) {
@@ -249,6 +267,22 @@ export function useWebRTC({ roomId, name, localStream }) {
       if (kind === "video") updatePeer(id, { camOn: enabled });
     });
 
+    socket.on("peer-screen-share", ({ id, enabled }) => {
+      updatePeer(id, { screenSharing: enabled });
+    });
+
+    socket.on("peer-raise-hand", ({ id, raised }) => {
+      updatePeer(id, { handRaised: raised });
+    });
+
+    socket.on("peer-reaction", ({ id, name: peerName, emoji, ts }) => {
+      const key = `${id}-${ts}-${Math.random().toString(36).slice(2, 7)}`;
+      setReactions((prev) => [...prev, { key, id, name: peerName, emoji }]);
+      setTimeout(() => {
+        setReactions((prev) => prev.filter((r) => r.key !== key));
+      }, REACTION_LIFETIME_MS);
+    });
+
     socket.on("connect", () => {
       socket.emit("join-room", { roomId, name }, (res) => {
         if (cancelled) return;
@@ -272,6 +306,9 @@ export function useWebRTC({ roomId, name, localStream }) {
       socket.off("chat-message");
       socket.off("typing");
       socket.off("peer-media-state");
+      socket.off("peer-screen-share");
+      socket.off("peer-raise-hand");
+      socket.off("peer-reaction");
       socket.off("connect");
       peerConnections.current.forEach((pc) => pc.close());
       peerConnections.current.clear();
@@ -293,14 +330,48 @@ export function useWebRTC({ roomId, name, localStream }) {
     socket.emit("media-state", { kind, enabled });
   }, []);
 
+  // ------------------------------------------------------------------
+  // Partage d'ecran : remplace la piste video envoyee a TOUTES les
+  // connexions existantes (sans renegociation SDP, RTCRtpSender.replaceTrack
+  // le permet), et memorise la piste pour les connexions futures.
+  // ------------------------------------------------------------------
+  const replaceOutgoingVideoTrack = useCallback((newTrack) => {
+    outgoingVideoTrackRef.current = newTrack;
+    peerConnections.current.forEach((pc) => {
+      const sender = pc.getSenders().find((s) => s.track && s.track.kind === "video");
+      if (sender) sender.replaceTrack(newTrack);
+    });
+  }, []);
+
+  // Retourne une promesse : le serveur peut refuser si quelqu'un d'autre
+  // partage deja son ecran dans la salle.
+  const setScreenShareState = useCallback((enabled) => {
+    return new Promise((resolve) => {
+      socket.emit("screen-share-state", { enabled }, (res) => resolve(res || { ok: false }));
+    });
+  }, []);
+
+  const setRaiseHand = useCallback((raised) => {
+    socket.emit("raise-hand", { raised });
+  }, []);
+
+  const sendReaction = useCallback((emoji) => {
+    socket.emit("reaction", { emoji });
+  }, []);
+
   return {
     status,
     errorMessage,
     peers,
     chatMessages,
     typingUsers,
+    reactions,
     sendChatMessage,
     sendTyping,
     broadcastMediaState,
+    replaceOutgoingVideoTrack,
+    setScreenShareState,
+    setRaiseHand,
+    sendReaction,
   };
 }
