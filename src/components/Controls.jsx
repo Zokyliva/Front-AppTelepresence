@@ -16,13 +16,13 @@ import {
 
 const QUICK_REACTIONS = ["👍", "❤️", "😂", "👏", "🎉", "😮"];
 
-function ControlButton({ active, danger, onClick, label, children }) {
+function ControlButton({ active, danger, onClick, label, children, badge }) {
   return (
     <button
       onClick={onClick}
       aria-label={label}
       title={label}
-      className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-full border transition active:scale-90 ${
+      className={`relative flex h-11 w-11 shrink-0 items-center justify-center rounded-full border transition active:scale-90 ${
         danger
           ? "border-tally bg-tally text-paper"
           : active
@@ -31,6 +31,11 @@ function ControlButton({ active, danger, onClick, label, children }) {
       }`}
     >
       {children}
+      {badge > 0 && (
+        <span className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-tally px-1 font-tech text-[10px] font-semibold text-paper">
+          {badge}
+        </span>
+      )}
     </button>
   );
 }
@@ -51,6 +56,7 @@ export default function Controls({
   onCopyLink,
   participantCount,
   maxParticipants,
+  waitingCount = 0,
 }) {
   const [pickerOpen, setPickerOpen] = useState(false);
   const pickerRef = useRef(null);
@@ -133,7 +139,11 @@ export default function Controls({
             )}
           </div>
 
-          <ControlButton onClick={onToggleParticipants} label="Voir les participants">
+          <ControlButton
+            onClick={onToggleParticipants}
+            label="Voir les participants"
+            badge={waitingCount}
+          >
             <Users size={19} />
           </ControlButton>
 

@@ -36,13 +36,29 @@ const REACTION_LIFETIME_MS = 2500;
  * plafonne les salles a 25 participants.
  */
 export function useWebRTC({ roomId, name, localStream }) {
-  const [status, setStatus] = useState("connecting"); // connecting | connected | error | full
+  // connecting | waiting | connected | error | full | denied | kicked
+  const [status, setStatus] = useState("connecting");
   const [errorMessage, setErrorMessage] = useState("");
   // peers: { [peerId]: { name, stream, micOn, camOn, screenSharing, handRaised } }
   const [peers, setPeers] = useState({});
   const [chatMessages, setChatMessages] = useState([]);
   const [typingUsers, setTypingUsers] = useState({}); // { [peerId]: name }
   const [reactions, setReactions] = useState([]); // [{ key, id, name, emoji }]
+
+  // Role d'hote : le createur de la salle (ou son successeur si l'hote
+  // quitte). Determine ce que l'UI autorise (valider les entrees, sourdine
+  // forcee, expulsion).
+  const [hostId, setHostId] = useState(null);
+  const isHost = hostId !== null && hostId === socket.id;
+
+  // Uniquement pertinent pour l'hote : demandes d'entree en attente de
+  // validation. [{ id, name }]
+  const [waitingList, setWaitingList] = useState([]);
+
+  // Compteur incremente a chaque fois que le serveur nous force la
+  // sourdine : Room.jsx observe ce compteur pour reellement couper la
+  // piste audio locale (le hook n'a pas acces au localStream lui-meme).
+  const [forceMuteSignal, setForceMuteSignal] = useState(0);
 
   const peerConnections = useRef(new Map()); // peerId -> RTCPeerConnection
   const pendingCandidates = useRef(new Map()); // peerId -> ICE candidates en attente
@@ -283,6 +299,60 @@ export function useWebRTC({ roomId, name, localStream }) {
       }, REACTION_LIFETIME_MS);
     });
 
+    // ------------------------------------------------------------
+    // Salle d'attente : evenements recus uniquement par l'hote
+    // ------------------------------------------------------------
+    socket.on("waiting-room-request", ({ id, name: peerName }) => {
+      setWaitingList((prev) =>
+        prev.some((w) => w.id === id) ? prev : [...prev, { id, name: peerName }]
+      );
+    });
+
+    socket.on("waiting-room-cancelled", ({ id }) => {
+      setWaitingList((prev) => prev.filter((w) => w.id !== id));
+    });
+
+    // Recu par le nouvel hote quand le role lui est transfere, avec la
+    // liste d'attente en cours a reprendre.
+    socket.on("waiting-room-sync", ({ waiting }) => {
+      setWaitingList(waiting || []);
+    });
+
+    socket.on("host-changed", ({ hostId: newHostId }) => {
+      setHostId(newHostId);
+      if (newHostId !== socket.id) setWaitingList([]);
+    });
+
+    // ------------------------------------------------------------
+    // Salle d'attente : evenements recus par le participant en attente
+    // ------------------------------------------------------------
+    socket.on("admitted", (res) => {
+      if (cancelled) return;
+      setStatus("connected");
+      setHostId(res.hostId);
+      setChatMessages(res.chatHistory || []);
+      res.participants.forEach((p) => callPeer(p.id, p.name));
+    });
+
+    socket.on("join-denied", ({ reason }) => {
+      if (cancelled) return;
+      setStatus("denied");
+      setErrorMessage(reason || "L'hôte a refusé ta demande d'accès.");
+    });
+
+    // ------------------------------------------------------------
+    // Controles de l'hote qui nous ciblent personnellement
+    // ------------------------------------------------------------
+    socket.on("force-muted", () => {
+      setForceMuteSignal((n) => n + 1);
+    });
+
+    socket.on("kicked", () => {
+      if (cancelled) return;
+      setStatus("kicked");
+      setErrorMessage("L'hôte t'a retiré de la salle.");
+    });
+
     socket.on("connect", () => {
       socket.emit("join-room", { roomId, name }, (res) => {
         if (cancelled) return;
@@ -291,7 +361,15 @@ export function useWebRTC({ roomId, name, localStream }) {
           setErrorMessage(res?.error || "Impossible de rejoindre la salle.");
           return;
         }
+        if (res.pending) {
+          // On patiente : c'est l'evenement "admitted" ou "join-denied"
+          // qui fera avancer le statut ensuite.
+          setStatus("waiting");
+          return;
+        }
         setStatus("connected");
+        setHostId(res.hostId);
+        setChatMessages(res.chatHistory || []);
         // On initie une offre vers chaque participant deja present
         res.participants.forEach((p) => callPeer(p.id, p.name));
       });
@@ -309,6 +387,14 @@ export function useWebRTC({ roomId, name, localStream }) {
       socket.off("peer-screen-share");
       socket.off("peer-raise-hand");
       socket.off("peer-reaction");
+      socket.off("waiting-room-request");
+      socket.off("waiting-room-cancelled");
+      socket.off("waiting-room-sync");
+      socket.off("host-changed");
+      socket.off("admitted");
+      socket.off("join-denied");
+      socket.off("force-muted");
+      socket.off("kicked");
       socket.off("connect");
       peerConnections.current.forEach((pc) => pc.close());
       peerConnections.current.clear();
@@ -359,6 +445,27 @@ export function useWebRTC({ roomId, name, localStream }) {
     socket.emit("reaction", { emoji });
   }, []);
 
+  // ------------------------------------------------------------------
+  // Controles reserves a l'hote (le serveur revalide de toute facon).
+  // ------------------------------------------------------------------
+  const admitParticipant = useCallback((id) => {
+    socket.emit("admit-participant", { id });
+    setWaitingList((prev) => prev.filter((w) => w.id !== id));
+  }, []);
+
+  const denyParticipant = useCallback((id) => {
+    socket.emit("deny-participant", { id });
+    setWaitingList((prev) => prev.filter((w) => w.id !== id));
+  }, []);
+
+  const forceMuteParticipant = useCallback((id) => {
+    socket.emit("force-mute", { id });
+  }, []);
+
+  const kickParticipant = useCallback((id) => {
+    socket.emit("kick-participant", { id });
+  }, []);
+
   return {
     status,
     errorMessage,
@@ -366,6 +473,10 @@ export function useWebRTC({ roomId, name, localStream }) {
     chatMessages,
     typingUsers,
     reactions,
+    hostId,
+    isHost,
+    waitingList,
+    forceMuteSignal,
     sendChatMessage,
     sendTyping,
     broadcastMediaState,
@@ -373,5 +484,9 @@ export function useWebRTC({ roomId, name, localStream }) {
     setScreenShareState,
     setRaiseHand,
     sendReaction,
+    admitParticipant,
+    denyParticipant,
+    forceMuteParticipant,
+    kickParticipant,
   };
 }

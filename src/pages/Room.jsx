@@ -5,6 +5,7 @@ import VideoTile from "../components/VideoTile.jsx";
 import Chat from "../components/Chat.jsx";
 import Controls from "../components/Controls.jsx";
 import ParticipantsList from "../components/ParticipantsList.jsx";
+import WaitingScreen from "../components/WaitingScreen.jsx";
 import { useWebRTC } from "../hooks/useWebRTC.js";
 import { socket } from "../lib/socket.js";
 
@@ -86,6 +87,10 @@ export default function Room() {
     chatMessages,
     typingUsers,
     reactions,
+    hostId,
+    isHost,
+    waitingList,
+    forceMuteSignal,
     sendChatMessage,
     sendTyping,
     broadcastMediaState,
@@ -93,7 +98,30 @@ export default function Room() {
     setScreenShareState,
     setRaiseHand,
     sendReaction,
+    admitParticipant,
+    denyParticipant,
+    forceMuteParticipant,
+    kickParticipant,
   } = useWebRTC({ roomId, name, localStream });
+
+  // Le serveur a valide une sourdine forcee par l'hote : on coupe la piste
+  // localement (le hook n'a pas acces au localStream, donc on reagit ici
+  // au compteur qu'il expose).
+  const isFirstForceMute = useRef(true);
+  useEffect(() => {
+    if (isFirstForceMute.current) {
+      isFirstForceMute.current = false;
+      return;
+    }
+    const track = localStream?.getAudioTracks()[0];
+    if (track) {
+      track.enabled = false;
+      setMicOn(false);
+      broadcastMediaState("audio", false);
+    }
+    showToast("L'hôte a coupé ton micro.");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [forceMuteSignal]);
 
   function showToast(message) {
     setToast(message);
@@ -227,6 +255,27 @@ export default function Room() {
 
   if (!name) return null;
 
+  // Salle d'attente : on affiche un ecran dedie tant que l'hote n'a pas
+  // valide l'entree (ou l'a refusee / que l'on a ete expulse).
+  if (status === "waiting") {
+    return <WaitingScreen roomId={roomId} onLeave={() => navigate("/")} />;
+  }
+  if (status === "denied" || status === "kicked") {
+    localStream?.getTracks().forEach((t) => t.stop());
+    return (
+      <div className="flex h-dvh flex-col items-center justify-center gap-4 bg-ink px-4 text-center">
+        <p className="font-tech text-xs uppercase tracking-wide text-muted">Canal · {roomId}</p>
+        <p className="max-w-xs text-sm text-paper">{errorMessage}</p>
+        <button
+          onClick={() => navigate("/")}
+          className="rounded-xl bg-phosphor px-5 py-2.5 text-sm font-semibold text-ink transition hover:brightness-110"
+        >
+          Retour à l'accueil
+        </button>
+      </div>
+    );
+  }
+
   const panelContent =
     panel === "chat" ? (
       <Chat
@@ -243,6 +292,14 @@ export default function Room() {
         peerList={peerList}
         maxParticipants={MAX_PARTICIPANTS}
         onClose={() => setPanel(null)}
+        isHost={isHost}
+        hostId={hostId}
+        selfId={socket.id}
+        waitingList={waitingList}
+        onAdmit={admitParticipant}
+        onDeny={denyParticipant}
+        onForceMute={forceMuteParticipant}
+        onKick={kickParticipant}
       />
     ) : null;
 
@@ -267,13 +324,18 @@ export default function Room() {
         <div className="hidden items-center gap-2 md:flex">
           <button
             onClick={() => togglePanel("participants")}
-            className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs transition ${
+            className={`relative flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs transition ${
               panel === "participants"
                 ? "border-phosphor text-phosphor"
                 : "border-line text-paper hover:border-muted"
             }`}
           >
             <Users size={14} /> {participantCount}
+            {isHost && waitingList.length > 0 && (
+              <span className="absolute -right-1.5 -top-1.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-tally px-1 font-tech text-[10px] font-semibold text-paper">
+                {waitingList.length}
+              </span>
+            )}
           </button>
           <button
             onClick={() => togglePanel("chat")}
@@ -416,6 +478,7 @@ export default function Room() {
         onCopyLink={copyRoomLink}
         participantCount={participantCount}
         maxParticipants={MAX_PARTICIPANTS}
+        waitingCount={isHost ? waitingList.length : 0}
       />
     </div>
   );
